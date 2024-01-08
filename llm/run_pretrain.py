@@ -13,13 +13,11 @@
 # limitations under the License.
 import math
 import os
-import random
 import sys
 import time
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-import numpy as np
 import paddle
 
 from paddlenlp.data.causal_dataset import (
@@ -32,8 +30,10 @@ from paddlenlp.trainer import (
     Trainer,
     TrainingArguments,
     get_last_checkpoint,
+    set_seed,
     speed_metrics,
 )
+from paddlenlp.trainer.trainer_utils import IntervalStrategy
 from paddlenlp.transformers import (
     AutoConfig,
     AutoModelForCausalLM,
@@ -46,6 +46,8 @@ from paddlenlp.transformers import (
 from paddlenlp.utils.batch_sampler import DistributedBatchSampler
 from paddlenlp.utils.log import logger
 
+from utils import get_lora_target_modules
+from paddlenlp.peft import LoRAConfig, LoRAModel
 
 def add_start_docstrings(*docstr):
     def docstring_decorator(fn):
@@ -74,6 +76,26 @@ class PreTrainingArguments(TrainingArguments):
             "help": "Enable fused linear grad add strategy, which will reduce elementwise add for grad accumulation in the backward of nn.Linear ."
         },
     )
+    # NOTE(gongenlei): new add autotuner_benchmark
+    autotuner_benchmark: bool = field(
+        default=False,
+        metadata={"help": "Weather to run benchmark by autotuner. True for from_scratch and pad_max_length."},
+    )
+
+    def __post_init__(self):
+        super().__post_init__()
+        # NOTE(gongenlei): new add autotuner_benchmark
+        if self.autotuner_benchmark:
+            self.max_steps = 5
+            self.do_train = True
+            self.do_export = False
+            self.do_predict = False
+            self.do_eval = False
+            self.overwrite_output_dir = True
+            self.load_best_model_at_end = False
+            self.report_to = []
+            self.save_strategy = IntervalStrategy.NO
+            self.evaluation_strategy = IntervalStrategy.NO
 
 
 @dataclass
@@ -125,12 +147,9 @@ class ModelArguments:
         default=None, metadata={"help": "Pretrained tokenizer name or path if not the same as model_name"}
     )
 
-    config_name: Optional[str] = field(
-        default=None, metadata={"help": "Pretrained config name or path if not the same as model_name"}
-    )
     use_flash_attention: bool = field(
         default=False,
-        metadata={"help": "use_flash_attention"},
+        metadata={"help": "Whether to use flash attention"},
     )
     use_fused_rms_norm: bool = field(
         default=False,
@@ -152,6 +171,9 @@ class ModelArguments:
         default=1,
         metadata={"help": "virtual_pp_degree"},
     )
+    hidden_dropout_prob: float = field(default=0.1, metadata={"help": "The hidden dropout prob."})
+    attention_probs_dropout_prob: float = field(default=0.1, metadata={"help": "The attention hidden dropout prob."})
+
     continue_training: bool = field(
         default=False,
         metadata={
@@ -183,6 +205,23 @@ class ModelArguments:
     recompute_use_reentrant: bool = field(
         default=False,
         metadata={"help": "recompute_use_reentrant"},
+    )
+
+    # vocab_extend
+    use_vocab_extend: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Enable rope fusion or not."},
+    )
+    new_tokenizer_name_or_path: Optional[str] = field(
+        default=None, metadata={"help": "Pretrained new vocab tokenizer name or path"}
+    )
+    lora_rank: int = field(default=8, metadata={"help": "Lora attention dimension"})
+    lora_alpha: int = field(default=8, metadata={"help": "lora_alpha"})
+    lora_trainable: str = field(default=None, metadata={"help": "lora_trainable."})
+    modules_to_save: str = field(default=None, metadata={"help": "modules_to_save."})
+    lora_dropout: float = field(
+        default=None,
+        metadata={"help": "lora dropout."},
     )
 
 
@@ -271,7 +310,7 @@ def get_train_data_file(args):
             if (os.path.isfile(os.path.join(args.input_dir, f)) and ("_idx.npz" in str(f) or ".idx" in str(f)))
         ]
         files = [x.replace("_idx.npz", "") for x in files]
-        files = [x.replace(".idx", "") for x in files]  # add
+        files = [x.replace(".idx", "") for x in files]
 
         if len(files) > 1:
             ret = []
@@ -283,16 +322,6 @@ def get_train_data_file(args):
             return ret
 
     return files
-
-
-def set_seed(args):
-    if args.device == "cpu":
-        idx = 0
-    else:
-        idx = paddle.distributed.get_rank()
-    random.seed(args.seed + idx)
-    np.random.seed(args.seed + idx)
-    paddle.seed(args.seed + idx)
 
 
 class PretrainingTrainer(Trainer):
@@ -378,10 +407,8 @@ def main():
     if data_args.data_cache is not None:
         os.makedirs(data_args.data_cache, exist_ok=True)
 
-    set_seed(training_args)
     paddle.set_device(training_args.device)
-    if paddle.distributed.get_world_size() > 1:
-        paddle.distributed.init_parallel_env()
+    set_seed(seed=training_args.seed)
 
     training_args.eval_iters = 10
     training_args.test_iters = training_args.eval_iters * 10
@@ -435,13 +462,25 @@ def main():
     config.sequence_parallel = model_args.sequence_parallel
     config.fuse_sequence_parallel_allreduce = model_args.fuse_sequence_parallel_allreduce
     config.use_fused_rope = model_args.use_fused_rope
+
     config.no_recompute_layers = model_args.no_recompute_layers
     config.pp_recompute_interval = model_args.pp_recompute_interval
     config.recompute_use_reentrant = model_args.recompute_use_reentrant
-
     config.use_recompute = training_args.recompute
+
     config.tensor_parallel_degree = training_args.tensor_parallel_degree
     config.tensor_parallel_rank = training_args.tensor_parallel_rank
+
+    # Config for model using dropout, such as GPT.
+    config.hidden_dropout_prob = model_args.hidden_dropout_prob
+    config.attention_probs_dropout_prob = model_args.attention_probs_dropout_prob
+
+    config.sep_parallel_degree = training_args.sep_parallel_degree
+    if config.sequence_parallel:
+        assert config.tensor_parallel_degree > 1, "tensor_parallel_degree must be larger than 1 for sequence parallel."
+    assert (
+        config.num_attention_heads % config.sep_parallel_degree == 0
+    ), f"num_attention_heads:{config.num_attention_heads} must be divisible by sep_parallel_degree {config.sep_parallel_degree}"
 
     print("Final pre-training config:", config)
 
@@ -456,13 +495,24 @@ def main():
     model_class = AutoModelForCausalLM
     if training_args.pipeline_parallel_degree > 1:
         model_class = AutoModelForCausalLMPipe
+        if "LLama" in str(config.architectures):
+            try:
+                from register_reshard import register_pp_reshard_information
+
+                register_pp_reshard_information(config.num_hidden_layers)
+            except:
+                print("Not register llama pp reshard information.")
 
     if model_args.continue_training:
-        model = model_class.from_pretrained(
-            model_args.model_name_or_path,
-            config=config,
-            dtype=dtype,
-        )
+        # NOTE(gongenlei): new add
+        if training_args.autotuner_benchmark:
+            model = model_class.from_config(config, dtype=dtype)
+        else:
+            model = model_class.from_pretrained(
+                model_args.model_name_or_path,
+                config=config,
+                dtype=dtype,
+            )
     else:
         model = model_class.from_config(config, dtype=dtype)
 
@@ -474,10 +524,44 @@ def main():
     if training_args.recompute:
         model.recompute_enable()
 
+    if model_args.use_vocab_extend:
+        # new_tokenizer_name_or_path = model_args.new_tokenizer_name_or_path
+        # new_tokenizer = AutoTokenizer.from_pretrained(new_tokenizer_name_or_path)
+        # model.resize_token_embeddings(len(new_tokenizer))
+        # tokenizer = new_tokenizer
+        logger.info("Init new lora model")
+        modules_to_save = model_args.modules_to_save
+        if modules_to_save is not None:
+            modules_to_save = modules_to_save.split(",")
+        lora_rank = model_args.lora_rank
+        lora_dropout = model_args.lora_dropout
+        lora_alpha = model_args.lora_alpha
+        target_modules = get_lora_target_modules(model)
+        logger.info(f"target_modules: {target_modules}")
+        logger.info(f"lora_rank: {lora_rank}")
+        lora_config = LoRAConfig(
+            target_modules=target_modules,
+            r=lora_rank,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            merge_weights=False,
+            tensor_parallel_degree=training_args.tensor_parallel_degree,
+            dtype=dtype,
+            trainable_modules=modules_to_save,
+            # modules_to_save = modules_to_save,
+        )
+        model = LoRAModel(model, lora_config)
+        model.mark_only_lora_as_trainable()
+        model.print_trainable_parameters()
+        
     # Create the learning_rate sheduler and optimizer
     if training_args.decay_steps is None:
         training_args.decay_steps = training_args.max_steps
-    warmup_steps = training_args.warmup_ratio * training_args.max_steps
+
+    if training_args.warmup_steps > 0:
+        warmup_steps = training_args.warmup_steps
+    else:
+        warmup_steps = training_args.warmup_ratio * training_args.max_steps
 
     lr_scheduler = None
     if training_args.lr_scheduler_type.value == "cosine":
@@ -533,11 +617,15 @@ def main():
     # Training
     if training_args.do_train:
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
-        metrics = train_result.metrics
-        trainer.save_model()
-        trainer.log_metrics("train", metrics)
-        trainer.save_metrics("train", metrics)
-        trainer.save_state()
+
+        # NOTE(gongenlei): new add
+        if not training_args.autotuner_benchmark:
+            metrics = train_result.metrics
+            if not int(os.getenv("test_ci_no_save_model", 0)):
+                trainer.save_model()
+            trainer.log_metrics("train", metrics)
+            trainer.save_metrics("train", metrics)
+            trainer.save_state()
 
     if training_args.do_predict:
         test_ret = trainer.predict(test_dataset)
